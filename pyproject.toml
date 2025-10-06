@@ -1,0 +1,9 @@
+[project]
+name = "teamwork-minimal"
+version = "0.1"
+dependencies = [
+  "einops",
+  "torch",
+  "diffusers",
+]
+requires-python = ">=3.12"
