@@ -1,9 +1,27 @@
-# Teamwork
+<h1 align="center">Teamwork</h1>
+<p align="center">
+<a href="https://bin.samsartor.com/teamwork.pdf">📃 Paper</a> | <a href="https://samsartor.com/teamwork">🌐 Website</a> | <a href="https://bin.samsartor.com/teamwork_supplemental.pdf">🖼️ Supplemental</a>
+</p>
+<p align="center"><img width="700px" src="https://samsartor.com/teamwork_teaser.svg" /></p>
 
 The official implementation of "Teamwork: Collaborative Diffusion with Low-rank Coordination and Adaptation".
 
-**Currently only a minimal implementation is provided. The full implementation will be
-released before SIGGRAPH Asia 2025**
+You can use this whole repository as a package with `uv add git+https://github.com/samsartor/teamwork[diffusers]`.
+Alternatively, feel free to copy `minimal.py` as a starting-point for your own implementation.
+
+```python
+from teamwork.pipelines import TeamworkPipeline
+from PIL import Image
+
+pipe = TeamworkPipeline.from_checkpoint(
+    'samsartor/teamwork-release',
+    'decomposition_heterogeneous_sd3.safetensors',
+).to('cuda')
+
+generated = pipe({'image': Image.open('./demo/red_glass_sphere.png'})
+```
+
+See the notebooks folder for complete examples.
 
 ## Abstract
 
@@ -19,8 +37,8 @@ ing a pretrained diffusion model to new tasks. Teamwork achieves channel
 expansion without altering the pretrained diffusion model architecture by
 coordinating and adapting multiple instances of the base diffusion model
 (i.e., teammates). We employ a novel variation of Low Rank-Adaptation
-(LoRA) to jointly address both adaptation and coordination between the dif-
-ferent teammates. Furthermore Teamwork supports dynamic (de)activation
+(LoRA) to jointly address both adaptation and coordination between the
+different teammates. Furthermore Teamwork supports dynamic (de)activation
 of teammates. We demonstrate the flexibility and efficiency of Teamwork
 on a variety of generative and inverse graphics tasks such as inpainting,
 single image SVBRDF estimation, intrinsic decomposition, neural shading,

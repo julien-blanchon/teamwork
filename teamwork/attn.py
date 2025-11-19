@@ -1,0 +1,359 @@
+import torch
+from torch import nn, Tensor
+import torch.nn.functional as F
+from diffusers.models.attention_processor import (
+    Attention,
+    AttnProcessor2_0,
+    JointAttnProcessor2_0,
+    FluxAttnProcessor2_0,
+)
+
+from teamwork.adapter import AdapterMixin, TeamworkConfig, shallowcopy_into
+from einops import rearrange
+
+
+class TeamworkJointAttention(Attention, AdapterMixin):
+    def __init__(self, base: Attention, cfg: TeamworkConfig):
+        shallowcopy_into(self, base)
+
+        self.adapter = nn.Parameter(torch.tensor(0.0))
+
+        if isinstance(base.processor, AttnProcessor2_0):
+            self.set_processor(TeamworkAttnProcessor())  # type: ignore
+        elif isinstance(self.processor, JointAttnProcessor2_0):
+            self.set_processor(TeamworkJointAttnProcessor())  # type: ignore
+        elif isinstance(self.processor, FluxAttnProcessor2_0):
+            self.set_processor(TeamworkFluxAttnProcessor())  # type: ignore
+        else:
+            assert False, (
+                f"no teamwork joint attention avalible for {self.processor.__class__}"
+            )
+
+
+class TeamworkAttnProcessor(AttnProcessor2_0):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor | None = None,
+        attention_mask: Tensor | None = None,
+        temb: Tensor | None = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(
+                batch_size, channel, height * width
+            ).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape
+            if encoder_hidden_states is None
+            else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(
+                attention_mask, sequence_length, batch_size
+            )
+            # scaled_dot_product_attention expects attention_mask shape to be
+            # (batch, heads, source_length, target_length)
+            attention_mask = attention_mask.view(
+                batch_size, attn.heads, -1, attention_mask.shape[-1]
+            )
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(
+                1, 2
+            )
+
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(
+                encoder_hidden_states
+            )
+
+        assert attn.to_k is not None
+        key = attn.to_k(encoder_hidden_states)
+        assert attn.to_v is not None
+        value = attn.to_v(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        t, h, l, _ = query.shape
+        _, _, s, _ = value.shape
+        query = rearrange(query, "(b t) h l f -> b h (t l) f", b=1, t=t, h=h, l=l)
+        key = rearrange(key, "(b t) h s f -> b h (t s) f", b=1, t=t, h=h, s=s)
+        value = rearrange(value, "(b t) h s f -> b h (t s) f", b=1, t=t, h=h, s=s)
+        # the output of sdp = (batch, num_heads, seq_len, head_dim)
+        # TODO: add support for attn.scale when we move to Torch 2.1
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = rearrange(
+            hidden_states, "b h (t l) f -> (b t) h l f", b=1, t=t, h=h, l=l
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, -1, attn.heads * head_dim
+        )
+        hidden_states = hidden_states.to(query.dtype)
+
+        # linear proj
+        assert attn.to_out is not None
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(
+                batch_size, channel, height, width
+            )
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+
+class TeamworkJointAttnProcessor(JointAttnProcessor2_0):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor | None = None,
+        attention_mask: Tensor | None = None,
+        *args,
+        **kwargs,
+    ):
+        residual = hidden_states
+
+        batch_size = hidden_states.shape[0]
+
+        # `sample` projections.
+        query = attn.to_q(hidden_states)
+        assert attn.to_k is not None
+        key = attn.to_k(hidden_states)
+        assert attn.to_v is not None
+        value = attn.to_v(hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        # `context` projections.
+        if encoder_hidden_states is not None:
+            assert attn.add_q_proj is not None
+            assert attn.add_k_proj is not None
+            assert attn.add_v_proj is not None
+            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
+            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
+            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
+
+            encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+
+            if attn.norm_added_q is not None:
+                encoder_hidden_states_query_proj = attn.norm_added_q(
+                    encoder_hidden_states_query_proj
+                )
+            if attn.norm_added_k is not None:
+                encoder_hidden_states_key_proj = attn.norm_added_k(
+                    encoder_hidden_states_key_proj
+                )
+
+            query = torch.cat([query, encoder_hidden_states_query_proj], dim=2)
+            key = torch.cat([key, encoder_hidden_states_key_proj], dim=2)
+            value = torch.cat([value, encoder_hidden_states_value_proj], dim=2)
+
+        t, h, l, _ = query.shape
+        query = rearrange(query, "(b t) h l f -> b h (t l) f", b=1, t=t, h=h, l=l)
+        key = rearrange(key, "(b t) h l f -> b h (t l) f", b=1, t=t, h=h, l=l)
+        value = rearrange(value, "(b t) h l f -> b h (t l) f", b=1, t=t, h=h, l=l)
+        # print('communicating via attn', query.shape)
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = rearrange(
+            hidden_states, "b h (t l) f -> (b t) h l f", b=1, t=t, h=h, l=l
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, -1, attn.heads * head_dim
+        )
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            # Split the attention outputs.
+            hidden_states, encoder_hidden_states = (
+                hidden_states[:, : residual.shape[1]],
+                hidden_states[:, residual.shape[1] :],
+            )
+            if not attn.context_pre_only:
+                assert attn.to_add_out is not None
+                encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        assert attn.to_out is not None
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class TeamworkFluxAttnProcessor(FluxAttnProcessor2_0):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor | None = None,
+        attention_mask: Tensor | None = None,
+        image_rotary_emb: Tensor | None = None,
+    ) -> Tensor:
+        batch_size, _, _ = (
+            hidden_states.shape
+            if encoder_hidden_states is None
+            else encoder_hidden_states.shape
+        )
+
+        # `sample` projections.
+        query: Tensor = attn.to_q(hidden_states)
+        assert attn.to_k is not None
+        key: Tensor = attn.to_k(hidden_states)
+        assert attn.to_v is not None
+        value: Tensor = attn.to_v(hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
+        if encoder_hidden_states is not None:
+            assert attn.add_q_proj is not None
+            assert attn.add_k_proj is not None
+            assert attn.add_v_proj is not None
+            # `context` projections.
+            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
+            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
+            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
+
+            encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+            encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
+                batch_size, -1, attn.heads, head_dim
+            ).transpose(1, 2)
+
+            if attn.norm_added_q is not None:
+                encoder_hidden_states_query_proj = attn.norm_added_q(
+                    encoder_hidden_states_query_proj
+                )
+            if attn.norm_added_k is not None:
+                encoder_hidden_states_key_proj = attn.norm_added_k(
+                    encoder_hidden_states_key_proj
+                )
+
+            # attention
+            query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
+            key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
+            value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
+
+        if image_rotary_emb is not None:
+            from diffusers.models.embeddings import apply_rotary_emb
+
+            query = apply_rotary_emb(query, image_rotary_emb)
+            key = apply_rotary_emb(key, image_rotary_emb)
+
+        t, h, l, _ = query.shape
+        query = rearrange(query, "(b t) h l f -> b h (t l) f", b=1, t=t, h=h, l=l)
+        key = rearrange(key, "(b t) h l f -> b h (t l) f", b=1, t=t, h=h, l=l)
+        value = rearrange(value, "(b t) h l f -> b h (t l) f", b=1, t=t, h=h, l=l)
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = rearrange(
+            hidden_states, "b h (t l) f -> (b t) h l f", b=1, t=t, h=h, l=l
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, -1, attn.heads * head_dim
+        )
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = (
+                hidden_states[:, : encoder_hidden_states.shape[1]],
+                hidden_states[:, encoder_hidden_states.shape[1] :],
+            )
+
+            # linear proj
+            assert attn.to_out is not None
+            hidden_states = attn.to_out[0](hidden_states)
+            # dropout
+            hidden_states = attn.to_out[1](hidden_states)
+
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states

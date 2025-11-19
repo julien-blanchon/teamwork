@@ -1,9 +1,48 @@
 [project]
-name = "teamwork-minimal"
-version = "0.1"
+name = "teamwork"
+version = "1.0"
 dependencies = [
+  "numpy",
   "einops",
   "torch",
-  "diffusers",
+  "typer",
+  "pillow",
 ]
 requires-python = ">=3.12"
+description = "Teamwork adapts pretrained diffusion models while also increasing the number of input and output channels."
+readme = "README.md"
+license = "MIT AND Apache-2.0"
+authors = [
+    { name = "Sam Sartor", email = "me@samsartor.com" },
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.optional-dependencies]
+diffusers = [
+  "diffusers",
+  "huggingface_hub",
+  "transformers",
+  "accelerate",
+  "protobuf",
+  "sentencepiece",
+  "gguf",
+]
+jupyter = [
+  "jupyterlab",
+  "jupytext",
+  "ipython",
+  "ipyparallel",
+  "pynb",
+]
+train = [
+  "rerun-sdk",
+  "sacred",
+  "prodigyopt",
+  "gfxds",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/scripts", "/notebooks", "/demo"]
