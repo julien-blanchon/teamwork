@@ -17,7 +17,7 @@ import numpy as np
 from .pipelines import TeamworkPipeline
 from .config import TeamworkConfig
 from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules
-from .batch import BatchBuilder, image_pt2np, image_pt2pil
+from .batch import BatchBuilder, OutputImageType
 from .attn import TeamworkJointAttention
 
 
@@ -237,7 +237,7 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
     @torch.no_grad
     def __call__(  # type: ignore[override]
         self,
-        images: dict[str, Any],
+        images: dict[str, Any] | list[dict[str, Any]],
         request: list[str] | Literal["all"] = "all",
         prompt: str = "",
         num_inference_steps: int = 50,
@@ -245,16 +245,20 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
         noise: Tensor | None = None,
         height: int | None = None,
         width: int | None = None,
-        output_type: Literal["pil", "np", "pt", "latents"] = "pil",
+        output_type: OutputImageType = "pil",
+        batch: BatchBuilder | None = None,
     ) -> dict[str, Any]:
         device = self._execution_device
-        batch = BatchBuilder(self.teamwork_config.teammates, device, self.dtype)
-        for name, image in images.items():
-            batch.provide(name, image)
-        if request == "all":
-            batch.request_all(width=width, height=height)
-        else:
-            batch.request(*request, width=width, height=height)
+        if batch is None:
+            batch = BatchBuilder.from_inputs(
+                 self.teamwork_config.teammates,
+                 device=device,
+                 dtype=self.dtype,
+                 images=images,
+                 request=request,
+                 width=width,
+                 height=height,
+            )
 
         # Initialize latents
         sel = batch.selection()
@@ -379,20 +383,11 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
 
                 progress_bar.update()
 
-        latents[sel.input_subindices] = clean_latents[sel.input_subindices]
-        output_latents = batch.unpack_images(latents, outputs_only=True)
-        if output_type == "latents":
-            return output_latents
-        output_images = {}
-        for name, latents in output_latents.items():
-            output_images[name] = self.vae_decode(latents.unsqueeze(0)).squeeze(0)
-
-        if output_type == "pt":
-            return output_images
-        elif output_type == "np":
-            return {k: image_pt2np(v) for k, v in output_images.items()}
-        elif output_type == "pil":
-            return {k: image_pt2pil(v) for k, v in output_images.items()}
+        outputs = batch.unpack_decoded_images(latents, self.vae_decode, output_type=output_type)
+        if isinstance(images, list):
+            return outputs
+        else:
+            return outputs[0]
 
 
 TEAMWORK_PROFILES["FLUX"] = [

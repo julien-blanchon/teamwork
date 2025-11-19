@@ -122,6 +122,7 @@ def main(
     datasets: Annotated[Path, typer.Option()],
     num_samples: int = 64_000,
     accumulation: int = 16,
+    batch_size: int = 1,
     lora_rank: int = 64,
     eval_every: int = 500,
     save_every: int = 8_000,
@@ -130,6 +131,7 @@ def main(
     resume_step: int = -1,
     rerun_connect: str | None = "rerun+http://localhost:9876/proxy",
     dropout_prob: float = 0.0,
+    resize: int | None = None,
 ):
     args = locals()
     print(args)
@@ -177,6 +179,7 @@ def main(
         offset=max(resume_step, 0),
         replacement=True,  # type: ignore
         concurrent=8,
+        resize=(resize, resize) if resize else None,
     )
     train_loader.start()
     print(f"Found {len(train_loader)} training samples")
@@ -186,6 +189,7 @@ def main(
         limit=(num_samples // eval_every + 1),
         replacement=True,  # type: ignore
         concurrent=1,
+        resize=(resize, resize) if resize else None,
     )
     test_loader.start()
 
@@ -235,38 +239,36 @@ def main(
     smooth_loss = 0.0
 
     # Main training loop
-    train_step = resume_step
-    for train_batch in tqdm(train_loader, total=num_samples - resume_step):
+    end_step = num_samples // batch_size
+    for step_idx in tqdm(range(resume_step, end_step - 1)):
         try:
-            if rr.is_enabled():
-                rr.set_time("step", sequence=train_step)
-
             # Evaluate the model
-            if train_step % eval_every == 0:
-                eval_batch = next(test_loader)
-                generated = pipe({c: r.image for (c, r) in eval_batch.images.items()})
+            if step_idx % eval_every == 0:
+                eval_sample = next(test_loader)
+                generated = pipe({c: r.image for (c, r) in eval_sample.images.items()})
                 if rr.is_enabled():
                     for c, img in generated.items():
                         rr.log(f"eval/est/{c}", rr.Image(img))
-                    for c, r in eval_batch.images.items():
+                    for c, r in eval_sample.images.items():
                         rr.log(f"eval/gt/{c}", rr.Image(r.image))
 
-            if train_step % save_every == 0:
+            if step_idx % save_every == 0:
                 pipe.save_adapters(output_checkpoint)
 
             # Get a batch of training data
             batch = BatchBuilder(pipe.teamwork_config.teammates, device, dtype)
-            weight = (
-                train_batch.images.pop("weight").image
-                if "weight" in train_batch.images
-                else None
-            )
-            for c, r in train_batch.images.items():
-                batch.provide(c, r.image, weight=weight, cropinfo=r.crop)
-            if random() < dropout_prob and batch.count >= 2:
-                batch.components = sample(
-                    batch.components, k=randint(1, batch.count - 1)
-                )
+            for batch_idx in range(batch_size):
+                train_sample = next(train_loader)
+                weight = (
+                    train_sample.images.pop("weight").image
+                    if "weight" in train_sample.images
+                    else None
+                )               
+                if random() < dropout_prob and len(train_sample.images) >= 2:
+                    train_sample.images = sample(train_sample.images, k=randint(1, len(train_sample.images) - 1))
+                for c, r in train_sample.images.items():
+                    batch.provide(c, r.image, weight=weight, cropinfo=r.crop, batch_idx=batch_idx)
+
             assert batch.resolution is not None
             h, w = batch.resolution
             lh = h // pipe.vae_scale_factor
@@ -280,6 +282,9 @@ def main(
             )
 
             # Backpropagate
+            if rr.is_enabled():
+                rr.set_time("step", sequence=step_idx)
+
             loss = pipe.train_loss(batch, noise)
             log_loss = loss.clone().detach().item()
             del batch
@@ -298,13 +303,13 @@ def main(
                 rr.log("smooth_loss", rr.Scalars(smooth_loss))
 
             # Take an optimizer step every args.accumulation steps
-            if train_step % accumulation == accumulation - 1:
+            if step_idx % accumulation == accumulation - 1:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 if rr.is_enabled():
                     rr.log("grad_norm", rr.Scalars(grad_norm.cpu().item()))
 
                 lr = (
-                    base_lr * math.cos(train_step / (num_samples) * math.pi) * 0.5 + 0.5
+                    base_lr * math.cos(step_idx / end_step * math.pi) * 0.5 + 0.5
                 )
                 optimizer.defaults["lr"] = lr
                 if rr.is_enabled():
@@ -314,7 +319,7 @@ def main(
                 optimizer.zero_grad(set_to_none=True)
 
             pdb_check()
-            train_step += 1
+            step_idx += 1
         except Exception as e:
             pdb_exception(e)
 

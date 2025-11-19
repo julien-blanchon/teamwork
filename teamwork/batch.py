@@ -3,20 +3,23 @@ import torch
 from torch import Tensor
 import numpy as np
 from random import randint
-from typing import Callable
+from typing import Callable, TypeAlias, Any, Literal
 import PIL.Image
 
 
 @dataclass(frozen=True)
 class Selection:
-    teammate_indices: Tensor
+    teammate_indices: Tensor # (components,): int
     input_subindices: Tensor  # (input_components,): int
     output_subindices: Tensor  # (output_components,): int
+    batch_indices: Tensor # (components): int
+    batch_matrix: Tensor # (components, batch): bool
 
 
 @dataclass
 class ComponentInBatch:
     teammate: int
+    batch_idx: int
     component: str
     image: Tensor | None
     extra: Tensor | None
@@ -42,6 +45,9 @@ def image_pt2pil(image_pt: Tensor):
     return image_np2pil(image_pt2np(image_pt))
 
 
+OutputImageType: TypeAlias = Literal["pil", "np", "pt", "latents"]
+
+
 class BatchBuilder:
     """
     Teamwork requires arranging input images and empty outputs into a batch, with information
@@ -57,6 +63,29 @@ class BatchBuilder:
         self.components: list[ComponentInBatch] = []
         self.resolution: tuple[int, int] | None = None
 
+    @classmethod
+    def from_inputs(
+        cls,
+        teammates: list[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        images: dict[str, Any] | list[dict[str, Any]],
+        request: list[str] | Literal["all"] = "all",
+        height: int | None = None,
+        width: int | None = None,
+    ):
+        batch = cls(teammates, device, dtype)
+        if not isinstance(images, list):
+            images = [images]
+        for batch_idx, images_dict in enumerate(images):
+            for name, image in images_dict.items():
+                batch.provide(name, image, batch_idx=batch_idx)
+            if request == "all":
+                batch.request_all(width=width, height=height, batch_idx=batch_idx)
+            else:
+                batch.request(*request, width=width, height=height, batch_idx=batch_idx)
+        return batch
+
     def provide(
         self,
         component: str,
@@ -66,6 +95,7 @@ class BatchBuilder:
         cropinfo: np.ndarray | None = None,
         kind: str | None = None,
         image_format: str = "auto",
+        batch_idx: int = 0,
     ):
         """
         Provide a known image, either as input or to compute output loss.
@@ -168,6 +198,7 @@ class BatchBuilder:
                 self.components.append(
                     ComponentInBatch(
                         teammate=idx,
+                        batch_idx=batch_idx,
                         component=component,
                         image=image_tensor,
                         extra=concat_tensor,
@@ -177,14 +208,18 @@ class BatchBuilder:
                     )
                 )
 
-    def request_all(self, width: int | None = None, height: int | None = None):
+    def request_all(self, width: int | None = None, height: int | None = None, batch_idx: int = 0):
         for teammate in self.teammates:
             teammate_component, teammate_kind = teammate.split(".")
             if teammate_kind == "out":
-                self.request(teammate_component, width=width, height=height)
+                self.request(teammate_component, width=width, height=height, batch_idx=batch_idx)
 
     def request(
-        self, *components: str, width: int | None = None, height: int | None = None
+        self,
+        *components: str,
+        width: int | None = None,
+        height: int | None = None,
+        batch_idx: int = 0,
     ):
         """
         Request that the model produce some outputs and include a placeholder. The resolution
@@ -204,11 +239,15 @@ class BatchBuilder:
             for idx, teammate in enumerate(self.teammates):
                 teammate_component, teammate_kind = teammate.split(".")
                 if teammate_component == component and teammate_kind == "out":
-                    if any(existing.teammate == idx for existing in self.components):
+                    if any(
+                        existing.teammate == idx and existing.batch_idx == batch_idx
+                        for existing in self.components
+                    ):
                         continue
                     self.components.append(
                         ComponentInBatch(
                             teammate=idx,
+                            batch_idx=batch_idx,
                             component=component,
                             image=None,
                             extra=None,
@@ -245,18 +284,24 @@ class BatchBuilder:
             if component.extra is not None:
                 component.extra = component.extra[:, i : i + s, j : j + s]
 
-    def pack_images(self, images: dict[str, Tensor], channels: int, scale: float = 1):
-        for c in self.components:
-            if c.component in images:
-                found_channels = images[c.component].shape[0]
-                assert found_channels == channels, (
-                    f"found image with {found_channels} channels, expected {channels}"
-                )
+    def packed_images(self) -> Tensor:
+        return self.packed_encoded_images(lambda x: x, 3, scale=1.0)
 
+    def packed_encoded_images(
+        self,
+        encode: Callable[[Tensor], Tensor],
+        channels: int,
+        scale: float,
+    ) -> Tensor:
         to_pack = []
         for c in self.components:
-            if c.component in images:
-                to_pack.append(images[c.component].to(self.device, self.dtype))
+            if c.image is not None:
+                encoded_image = encode(c.image.unsqueeze(0)).squeeze(0)
+                found_channels = encoded_image.shape[0]
+                assert found_channels == channels, (
+                    f"found {c.component} image with {found_channels} channels, expected {channels}"
+                )
+                to_pack.append(encoded_image.to(self.device, self.dtype))
             else:
                 assert self.resolution is not None
                 h, w = self.resolution
@@ -271,28 +316,6 @@ class BatchBuilder:
             torch.stack(to_pack)
             if to_pack
             else torch.empty(0, device=self.device, dtype=self.dtype)
-        )
-
-    def packed_images(self, channels: int) -> Tensor:
-        return self.pack_images(
-            {c.component: c.image for c in self.components if c.image is not None},
-            channels=channels,
-        )
-
-    def packed_encoded_images(
-        self,
-        encode: Callable[[Tensor], Tensor],
-        channels: int,
-        scale: float,
-    ) -> Tensor:
-        return self.pack_images(
-            {
-                c.component: encode(c.image.unsqueeze(0)).squeeze(0)
-                for c in self.components
-                if c.image is not None
-            },
-            channels=channels,
-            scale=scale,
         )
 
     def packed_extra(self) -> Tensor | None:
@@ -386,6 +409,8 @@ class BatchBuilder:
         teammate_indices = []
         input_indices = []
         output_indices = []
+        batch_indices = []
+        batch_matrix = torch.zeros(self.count, self.batch_size, dtype=torch.bool)
 
         for i, component in enumerate(self.components):
             teammate_indices.append(component.teammate)
@@ -393,6 +418,8 @@ class BatchBuilder:
                 output_indices.append(i)
             else:
                 input_indices.append(i)
+            batch_indices.append(component.batch_idx)
+            batch_matrix[i, component.batch_idx] = True
 
         return Selection(
             teammate_indices=torch.tensor(
@@ -404,24 +431,56 @@ class BatchBuilder:
             output_subindices=torch.tensor(
                 output_indices, dtype=torch.int64, device=self.device
             ),
+            batch_indices=torch.tensor(
+                batch_indices, dtype=torch.int64, device=self.device
+            ),
+            batch_matrix=batch_matrix.to(self.device),
         )
 
-    def unpack_images(
-        self, packed: Tensor, outputs_only: bool = False
-    ) -> dict[str, Tensor]:
-        unpacked = dict()
+    def unpack_decoded_images(
+        self,
+        packed: Tensor,
+        decode: Callable[[Tensor], Tensor],
+        output_type: OutputImageType = 'pil',
+        outputs_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        unpacked = [dict() for _ in range(self.batch_size)]
         for idx, component in enumerate(self.components):
             if component.output or not outputs_only:
-                unpacked[component.component] = packed[idx]
+                match output_type:
+                    case 'latents':
+                        image = packed[idx]
+                    case 'pt':
+                        image = decode(packed[idx].unsqueeze(0)).squeeze(0)
+                    case 'np':
+                        image = image_pt2np(decode(packed[idx].unsqueeze(0)).squeeze(0))
+                    case 'pil':
+                        image = image_pt2pil(decode(packed[idx].unsqueeze(0)).squeeze(0))
+                    case _:
+                        raise ValueError(f'unkonwn output type "{output_type}"')
+                unpacked[component.batch_idx][component.component] = image
         return unpacked
 
-    def unpacked_images(self, outputs_only: bool = False) -> dict[str, Tensor]:
-        return {
-            c.component: c.image
-            for c in self.components
-            if c.image is not None and (c.output or not outputs_only)
-        }
+    def unpack_images(
+        self,
+        packed: Tensor,
+        output_type: OutputImageType = 'pil',
+        outputs_only: bool = True,
+    ) -> list[dict[str, Tensor]]:
+        assert output_type != 'latents', 'images are not encoded'
+        return self.unpack_decoded_images(packed, lambda x: x, output_type=output_type, outputs_only=outputs_only)
+
+    def unpacked_images(self, output_type: OutputImageType = 'pil', outputs_only: bool = False) -> list[dict[str, Tensor]]:
+        return self.unpack_images(self, self.packed_images(), output_type=output_type, outputs_only=outputs_only)
 
     @property
     def count(self):
         return len(self.components)
+
+    @property
+    def batch_size(self):
+        if self.count == 0:
+            return 0
+        else:
+            return max(c.batch_idx for c in self.components) + 1
+        

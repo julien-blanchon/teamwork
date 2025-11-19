@@ -12,7 +12,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from .pipelines import TeamworkPipeline
 from .adapter import TEAMWORK_PROFILES, save_entire, Adapt
 from .config import TeamworkConfig
-from .batch import BatchBuilder, image_pt2np, image_pt2pil
+from .batch import BatchBuilder, OutputImageType
 
 DEFAULT_COMPONENT_PROMPTS = {
     "image.in": "Image",
@@ -238,34 +238,36 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
     @torch.no_grad()
     def __call__(  # type: ignore[override]
         self,
-        images: dict[str, Any],
+        images: dict[str, Any] | list[dict[str, Any]],
         request: list[str] | Literal["all"] = "all",
         prompt: str = "",
         num_inference_steps: int = 50,
         noise: Tensor | None = None,
         height: int | None = None,
         width: int | None = None,
-        output_type: Literal["pil", "np", "pt", "latents"] = "pil",
-    ) -> dict[str, Any]:
+        output_type: OutputImageType = "pil",
+        batch: BatchBuilder | None = None,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         device = self._execution_device
-        batch = BatchBuilder(self.teamwork_config.teammates, device, self.dtype)
-        for name, image in images.items():
-            batch.provide(name, image)
-        if request == "all":
-            batch.request_all(width=width, height=height)
-        else:
-            batch.request(*request, width=width, height=height)
+        if batch is None:
+            batch = BatchBuilder.from_inputs(
+                 self.teamwork_config.teammates,
+                 device=device,
+                 dtype=self.dtype,
+                 images=images,
+                 request=request,
+                 width=width,
+                 height=height,
+            )
 
         # Split into control signal and outputs
         ibatch, obatch = batch.split_io()
-        assert ibatch.count == 1, (
+        assert ibatch.count == ibatch.batch_size, (
             "this rgb2x implementation only supports a single input"
         )
         control_img = ibatch.packed_encoded_images(
-            self.vae_encode,
-            self.transformer.config["in_channels"],
-            1 / self.vae_scale_factor,
-        ).repeat(obatch.count, 1, 1, 1)
+            self.vae_encode, self.unet.config["in_channels"], 1 / self.vae_scale_factor
+        ).repeat(obatch.count // ibatch.count, 1, 1, 1)
 
         # Initialize latents
         sel = obatch.selection()
@@ -332,19 +334,11 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
 
                 progress_bar.update()
 
-        output_latents = obatch.unpack_images(latents, outputs_only=True)
-        if output_type == "latents":
-            return output_latents
-        output_images = {}
-        for name, latents in output_latents.items():
-            output_images[name] = self.vae_decode(latents.unsqueeze(0)).squeeze(0)
-
-        if output_type == "pt":
-            return output_images
-        elif output_type == "np":
-            return {k: image_pt2np(v) for k, v in output_images.items()}
-        elif output_type == "pil":
-            return {k: image_pt2pil(v) for k, v in output_images.items()}
+        outputs = obatch.unpack_decoded_images(latents, self.vae_decode, output_type=output_type)
+        if isinstance(images, list):
+            return outputs
+        else:
+            return outputs[0]
 
 
 TEAMWORK_PROFILES["SD3_RGB2X"] = []

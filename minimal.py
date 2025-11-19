@@ -13,25 +13,19 @@ class TeamworkLora(nn.Module):
     ):
         super().__init__()
 
-        self.down = nn.Parameter(torch.empty([teammates, in_features, rank]))
-        nn.init.normal_(self.down, mean=0.0, std=0.02)
-        self.up = nn.Parameter(torch.empty([teammates, rank, out_features]))
-        nn.init.zeros_(self.up)
-        if bias:
-            self.bias = nn.Parameter(torch.empty([teammates, out_features]))
-            nn.init.zeros_(self.bias)
-        else:
-            self.bias = None
+        self.teammates = teammates
+        self.down = nn.Linear(teammates * in_features, rank, bias=False)
+        nn.init.normal_(self.down.weight, mean=0.0, std=0.02)
+        self.up = nn.Linear(rank, teammates * out_features, bias=bias)
+        nn.init.zeros_(self.up.weight)
+        if self.up.bias is not None:
+            nn.init.zeros_(self.up.bias)
 
     def forward(self, x: Tensor):
-        x = einsum(x, self.down, "t ... i, t i r -> ... r")
-        x = einsum(x, self.up, "... r, t r o -> t ... o")
-        if self.bias is not None:
-            b = self.bias
-            while len(b.shape) < len(x.shape):
-                b = b.unsqueeze(1)
-            x = x + b
-        return x
+        x = rearrange(x, '(b t) ... c -> b ... (t c)', t=self.teammates)
+        y = self.up(self.down(x))
+        y = rearrange(y, 'b ... (t c) -> (b t) ... c', t=self.teammates)
+        return y
 
 
 class TeamworkLinear(nn.Linear):

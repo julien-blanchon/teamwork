@@ -49,17 +49,27 @@ class TeamworkLinear(nn.Linear, AdapterMixin[LoraParameters]):
 
         if self.communicate:
             hidden = einsum(
-                input, self.sel(self.adapter.down), "t ... i, t i r -> ... r"
+                input,
+                self.sel(self.adapter.down),
+                self.selection.batch_matrix.to(input.dtype),
+                "t ... i, t i r, t b -> b ... r",
             )
             output += einsum(
-                hidden, self.sel(self.adapter.up), "... r, t r o -> t ... o"
+                hidden,
+                self.sel(self.adapter.up),
+                self.selection.batch_matrix.to(hidden.dtype),
+                "b ... r, t r o, t b -> t ... o",
             )
         else:
             hidden = einsum(
-                input, self.sel(self.adapter.down), "t ... i, t i r -> t ... r"
+                input,
+                self.sel(self.adapter.down),
+                "t ... i, t i r -> t ... r",
             )
             output += einsum(
-                hidden, self.sel(self.adapter.up), "t ... r, t r o -> t ... o"
+                hidden,
+                self.sel(self.adapter.up),
+                "t ... r, t r o -> t ... o",
             )
 
         if self.adapter.bias is not None:
@@ -96,17 +106,27 @@ class TeamworkConv2d(nn.Conv2d, AdapterMixin[LoraParameters]):
 
         if self.communicate:
             hidden = einsum(
-                input, self.sel(self.adapter.down), "t i h w, t i r -> h w r"
+                input,
+                self.sel(self.adapter.down),
+                self.selection.batch_matrix.to(input.dtype),
+                "t i h w, t i r, t b -> b h w r"
             )
             output += einsum(
-                hidden, self.sel(self.adapter.up), "h w r, t r o -> t o h w"
+                hidden,
+                self.sel(self.adapter.up),
+                self.selection.batch_matrix.to(hidden.dtype),
+                "b h w r, t r o, t b -> t o h w"
             )
         else:
             hidden = einsum(
-                input, self.sel(self.adapter.down), "t i h w, t i r -> t h w r"
+                input,
+                self.sel(self.adapter.down),
+                "t i h w, t i r -> t h w r",
             )
             output += einsum(
-                hidden, self.sel(self.adapter.up), "t h w r, t r o -> t o h w"
+                hidden,
+                self.sel(self.adapter.up),
+                "t h w r, t r o -> t o h w",
             )
 
         if self.adapter.bias is not None:
@@ -143,17 +163,27 @@ try:
 
             if self.communicate:
                 hidden = einsum(
-                    inputs, self.sel(self.adapter.down), "t ... i, t i r -> ... r"
+                    input,
+                    self.sel(self.adapter.down),
+                    self.selection.batch_matrix.to(input.dtype),
+                    "t ... i, t i r, t b -> b ... r",
                 )
                 output += einsum(
-                    hidden, self.sel(self.adapter.up), "... r, t r o -> t ... o"
+                    hidden,
+                    self.sel(self.adapter.up),
+                    self.selection.batch_matrix.to(hidden.dtype),
+                    "b ... r, t r o, t b -> t ... o",
                 )
             else:
                 hidden = einsum(
-                    inputs, self.sel(self.adapter.down), "t ... i, t i r -> t ... r"
+                    input,
+                    self.sel(self.adapter.down),
+                    "t ... i, t i r -> t ... r",
                 )
                 output += einsum(
-                    hidden, self.sel(self.adapter.up), "t ... r, t r o -> t ... o"
+                    hidden,
+                    self.sel(self.adapter.up),
+                    "t ... r, t r o -> t ... o",
                 )
 
             if self.adapter.bias is not None:
