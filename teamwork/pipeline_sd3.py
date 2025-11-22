@@ -9,7 +9,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 
-from .pipelines import TeamworkPipeline
+from .pipelines import TeamworkPipeline, LossOutput
 from .config import TeamworkConfig
 from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules
 from .batch import BatchBuilder, OutputImageType
@@ -100,8 +100,9 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         self,
         batch: BatchBuilder,
         noise: torch.Tensor,
-        prompt: str = "",
-    ) -> torch.Tensor:
+        model: Any | None = None,
+        prompt: str | list[str] = "",
+    ) -> LossOutput:
         assert isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler)
         assert self.scheduler.timesteps is not None
         assert self.scheduler.sigmas is not None
@@ -156,7 +157,7 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
                     prompt,
                     prompt,
                     prompt,
-                    num_images_per_prompt=latents.shape[0],
+                    num_images_per_prompt=latents.shape[0] if isinstance(prompt, str) else 1,
                     do_classifier_free_guidance=False,
                 )
 
@@ -170,7 +171,9 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         for adapter in adapter_modules(self.transformer).values():
             adapter.selection = sel
 
-        model_pred = self.transformer(
+        if model is None:
+            model = self.transformer
+        model_pred = model(
             hidden_states=model_input,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
@@ -178,18 +181,12 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
         ).sample
         latents_pred = model_pred * (-sigmas) + noisy_latents
 
-        loss = F.mse_loss(
-            latents_pred[sel.output_subindices],
-            latents[sel.output_subindices],
-            reduction="none",
+        return LossOutput(
+            prediction=latents_pred[sel.output_subindices],
+            target=latents[sel.output_subindices],
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1) * weighting,
+            type='signal',
         )
-        loss *= batch.packed_scaled_weights(1 / self.vae_scale_factor)[
-            sel.output_subindices
-        ].unsqueeze(1)
-        loss = loss.mean()
-        loss = loss * weighting
-
-        return loss
 
     @torch.no_grad
     def __call__(  # type: ignore[override]

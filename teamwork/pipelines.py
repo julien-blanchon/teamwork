@@ -1,12 +1,29 @@
 from pathlib import Path
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 from typing import Self, Any, Literal
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from .config import TeamworkConfig
 from .adapter import Adapt, load_safetensors
-from .batch import BatchBuilder
+from .batch import BatchBuilder, Selection
+
+@dataclass
+class LossOutput:
+    prediction: Tensor
+    target: Tensor
+    weight: Tensor
+    type: str
+
+    @property
+    def loss(self):
+        return (F.mse_loss(
+            self.prediction,
+            self.target,
+            reduction="none",
+        ) * self.weight).mean()
 
 
 class TeamworkPipeline(ABC):
@@ -100,9 +117,25 @@ class TeamworkPipeline(ABC):
         self,
         batch: BatchBuilder,
         noise: Tensor,
-    ) -> Tensor:
+        model: Any | None = None,
+    ) -> LossOutput:
         """
         Compute the diffusion loss on the given batch.
+
+        Args:
+            batch: the batch of data to train on
+            noise: the noise to add (should be batch.size*c*h*w)
+            model: model object to use if not the one attached to this pipeline (eg DistributedDataParallel)
+            
+            Implementations will usually take additional arguments such as prompt,
+            and can have class properties such as timestep_weight.
+
+        Returns:
+            prediction: the predicted values returned from the model
+            target: the expected values
+            weight: a loss weighting term, either a scalar or full b*c*h*w tensor
+            type: what are prediction and target (eg noise, signal, velocity)
+            loss: the MSE between prediction and target, scaled by weight
         """
         ...
 

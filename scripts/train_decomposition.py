@@ -284,8 +284,8 @@ def main(
             # Backpropagate
             if rr.is_enabled():
                 rr.set_time("step", sequence=step_idx)
-
-            loss = pipe.train_loss(batch, noise)
+                
+            loss = pipe.train_loss(batch, noise).loss
             log_loss = loss.clone().detach().item()
             del batch
             if loss.isfinite():

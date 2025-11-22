@@ -6,7 +6,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
     StableDiffusionPipeline,
 )
 
-from .pipelines import TeamworkPipeline
+from .pipelines import TeamworkPipeline, LossOutput
 from .adapter import TEAMWORK_PROFILES, save_entire, Adapt
 from .config import TeamworkConfig
 from .batch import BatchBuilder, OutputImageType
@@ -116,6 +116,7 @@ class StableDiffusionRGB2XPipeline(TeamworkPipeline, StableDiffusionPipeline):
         self,
         batch: BatchBuilder,
         noise: torch.Tensor,
+        model: Any | None = None,
         prompt: str = "",
     ) -> Tensor:
         with torch.no_grad():
@@ -151,8 +152,10 @@ class StableDiffusionRGB2XPipeline(TeamworkPipeline, StableDiffusionPipeline):
             # Get the target for loss depending on the prediction type
             if scheduler_config.prediction_type == "epsilon":
                 target = noise
+                pred_type = 'noise'
             elif scheduler_config.prediction_type == "v_prediction":
                 target = self.scheduler.get_velocity(latents, noise, timesteps)
+                pred_type = 'velocity'
             else:
                 raise ValueError(
                     f"Unknown prediction type {scheduler_config.prediction_type}"
@@ -183,24 +186,20 @@ class StableDiffusionRGB2XPipeline(TeamworkPipeline, StableDiffusionPipeline):
                 )
 
         # Predict the noise residual
-        model_pred = self.model(
+        if model is None:
+            model = self.unet
+        model_pred = model(
             sample=noisy_cond_latents,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
         ).sample
 
-        # Calculate loss
-        loss = F.mse_loss(
-            model_pred.float()[sel.output_subindices],
-            target.float()[sel.output_subindices],
-            reduction="none",
+        return LossOutput(
+            prediction=model_pred.float()[sel.output_subindices],
+            target=target.float()[sel.output_subindices],
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1),
+            type=pred_type,
         )
-        loss *= obatch.packed_scaled_weights(1 / self.vae_scale_factor)[
-            sel.output_subindices
-        ].unsqueeze(1)
-        loss = loss.mean()
-
-        return loss
 
     @torch.no_grad()
     def __call__(  # type: ignore[override]

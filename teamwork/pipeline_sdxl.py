@@ -7,7 +7,7 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import
 )
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
-from .pipelines import TeamworkPipeline
+from .pipelines import TeamworkPipeline, LossOutput
 from .config import TeamworkConfig
 from .adapter import adapt, save_adapters, TEAMWORK_PROFILES, Adapt, adapter_modules
 from .batch import BatchBuilder, OutputImageType
@@ -89,8 +89,9 @@ class StableDiffusionXLTeamworkPipeline(TeamworkPipeline, StableDiffusionXLPipel
         self,
         batch: BatchBuilder,
         noise: torch.Tensor,
+        model: Any | None = None,
         prompt: str = "",
-    ) -> Tensor:
+    ) -> LossOutput:
         with torch.no_grad():
             # Sample a random timestep for each image
             train_scheduler = DDPMScheduler.from_config(self.scheduler.config)
@@ -117,8 +118,10 @@ class StableDiffusionXLTeamworkPipeline(TeamworkPipeline, StableDiffusionXLPipel
             # Get the target for loss depending on the prediction type
             if scheduler_config.prediction_type == "epsilon":
                 target = noise
+                pred_type = 'noise'
             elif scheduler_config.prediction_type == "v_prediction":
                 target = train_scheduler.get_velocity(latents, noise, timesteps)
+                pred_type = 'velocity'
             else:
                 raise ValueError(
                     f"Unknown prediction type {scheduler_config.prediction_type}"
@@ -159,7 +162,9 @@ class StableDiffusionXLTeamworkPipeline(TeamworkPipeline, StableDiffusionXLPipel
             adapter.selection = sel
 
         # Predict the noise residual
-        model_pred = self.unet(
+        if model is None:
+            model = self.unet
+        model_pred = model(
             sample=model_input,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
@@ -169,18 +174,12 @@ class StableDiffusionXLTeamworkPipeline(TeamworkPipeline, StableDiffusionXLPipel
             },
         ).sample
 
-        # Calculate loss
-        loss = F.mse_loss(
-            model_pred.float()[sel.output_subindices],
-            target.float()[sel.output_subindices],
-            reduction="none",
+        return LossOutput(
+            prediction=model_pred.float()[sel.output_subindices],
+            target=target.float()[sel.output_subindices],
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1),
+            type=pred_type,
         )
-        loss *= batch.packed_scaled_weights(1 / self.vae_scale_factor)[
-            sel.output_subindices
-        ].unsqueeze(1)
-        loss = loss.mean()
-
-        return loss
 
     @torch.no_grad()
     def __call__(  # type: ignore[override]

@@ -9,7 +9,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 
-from .pipelines import TeamworkPipeline
+from .pipelines import TeamworkPipeline, LossOutput
 from .adapter import TEAMWORK_PROFILES, save_entire, Adapt
 from .config import TeamworkConfig
 from .batch import BatchBuilder, OutputImageType
@@ -134,8 +134,9 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
         self,
         batch: BatchBuilder,
         noise: torch.Tensor,
+        model: Any | None = None,
         prompt: str = "",
-    ) -> Tensor:
+    ) -> LossOutput:
         assert isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler)
         assert self.scheduler.timesteps is not None
         assert self.scheduler.sigmas is not None
@@ -215,7 +216,9 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
                 )
 
         # Predict the noise residual
-        model_pred = self.model(
+        if model is None:
+            model = self.transformer
+        model_pred = model(
             hidden_states=noisy_cond_latents,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
@@ -223,17 +226,12 @@ class StableDiffusion3RGB2XPipeline(TeamworkPipeline, StableDiffusion3Pipeline):
         ).sample
         latents_pred = model_pred * (-sigmas) + noisy_latents
 
-        # Calculate loss
-        loss = F.mse_loss(
-            latents_pred,
-            latents,
-            reduction="none",
+        return LossOutput(
+            prediction=latents_pred[sel.output_subindices],
+            target=latents[sel.output_subindices],
+            weight=batch.packed_scaled_weights(1 / self.vae_scale_factor)[sel.output_subindices].unsqueeze(1) * weighting,
+            type='signal',
         )
-        loss *= obatch.packed_scaled_weights(1 / self.vae_scale_factor).unsqueeze(1)
-        loss = loss.mean()
-        loss = loss * weighting
-
-        return loss
 
     @torch.no_grad()
     def __call__(  # type: ignore[override]
