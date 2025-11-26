@@ -177,6 +177,9 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
                     prompt,
                     num_images_per_prompt=latents.shape[0] if isinstance(prompt, str) else 1,
                 )
+            prompt_embeds = prompt_embeds.to(latents.dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(latents.dtype)
+            text_ids = text_ids.to(latents.dtype)
 
         # Concatenate extra channels if present
         model_latents = noisy_latents
@@ -292,6 +295,9 @@ class FluxTeamworkPipeline(TeamworkPipeline, FluxPipeline):
                 prompt,
                 num_images_per_prompt=latents.shape[0],
             )
+        prompt_embeds = prompt_embeds.to(latents.dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(latents.dtype)
+        text_ids = text_ids.to(latents.dtype)
 
         # Set timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)

@@ -160,6 +160,8 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
                     num_images_per_prompt=latents.shape[0] if isinstance(prompt, str) else 1,
                     do_classifier_free_guidance=False,
                 )
+            prompt_embeds = prompt_embeds.to(latents.dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(latents.dtype)
 
         # Concatenate extra channels if present
         model_input = noisy_latents
@@ -257,6 +259,8 @@ class StableDiffusion3TeamworkPipeline(TeamworkPipeline, StableDiffusion3Pipelin
                 num_images_per_prompt=latents.shape[0],
                 do_classifier_free_guidance=False,
             )
+        prompt_embeds = prompt_embeds.to(latents.dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(latents.dtype)
 
         # Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
